@@ -322,6 +322,17 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         RegisterClassA(&wc);
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    /* RECOMP_WINDOW_SCALE (the SDL host's setting) sizes this window too: a
+     * 640x480 frame at its native size is a small window on a modern
+     * display. A fraction is allowed here (1.5: 960x720). */
+    {
+        const char *ws = recomp_env(RENV_WINDOW_SCALE);
+        double f = ws ? atof(ws) : 1.0;
+        if (f >= 1.0 && f <= 8.0) {
+            r.right = (LONG)(s_fb_width * f + 0.5);
+            r.bottom = (LONG)(s_fb_height * f + 0.5);
+        }
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", s_title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,

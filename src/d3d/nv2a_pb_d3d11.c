@@ -490,6 +490,20 @@ static int init(void)
     RECT r = {0, 0, 640, 480};
     int full = nv2a_host_opts()->fullscreen;
     UINT bw = 640, bh = 480;
+    /* RECOMP_WINDOW_SCALE sizes this window and its swap chain (1.5:
+     * 960x720). At 640x480 a render.scale frame was drawn at 1280x960 and
+     * then squeezed into a 640x480 back buffer, which threw the extra
+     * resolution away. */
+    {
+        const char *ws = recomp_env(RENV_WINDOW_SCALE);
+        double f = ws ? atof(ws) : 1.0;
+        if (f >= 1.0 && f <= 8.0) {
+            bw = (UINT)(640 * f + 0.5);
+            bh = (UINT)(480 * f + 0.5);
+            r.right = (LONG)bw;
+            r.bottom = (LONG)bh;
+        }
+    }
 
     if (tried)
         return !s_failed;
@@ -3726,6 +3740,79 @@ static void present_blit(RenderTarget *rt, int filter)
     s_sc_init = 0;
 }
 
+/* ---- a host movie in place of the guest frame -----------------------------
+ *
+ * A title whose movie decoder does not run can decode the file on the host
+ * and hand each frame here (BGRA, any thread); every flip then presents the
+ * latest one, through the scaling blit, instead of the guest's surface,
+ * until a NULL frame gives the screen back. */
+static SRWLOCK    s_movie_lock = SRWLOCK_INIT;
+static uint8_t   *s_movie_px;            /* the latest frame, copied */
+static unsigned   s_movie_w, s_movie_h;
+static int        s_movie_on, s_movie_new;
+static RenderTarget s_movie_rt;          /* its texture: tex, srv, sizes only */
+
+void nv2a_pb_d3d11_movie_frame(const void *bgra, unsigned w, unsigned h)
+{
+    AcquireSRWLockExclusive(&s_movie_lock);
+    if (!bgra || !w || !h) {
+        s_movie_on = 0;
+    } else {
+        if (w != s_movie_w || h != s_movie_h || !s_movie_px) {
+            free(s_movie_px);
+            s_movie_px = (uint8_t *)malloc((size_t)w * h * 4);
+            s_movie_w = w;
+            s_movie_h = h;
+        }
+        if (s_movie_px) {
+            memcpy(s_movie_px, bgra, (size_t)w * h * 4);
+            s_movie_on = 1;
+            s_movie_new = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_movie_lock);
+}
+
+/* At a flip: present the movie frame, 1, or leave the flip to the guest
+ * frame, 0. */
+static int movie_present(void)
+{
+    int on;
+
+    AcquireSRWLockExclusive(&s_movie_lock);
+    on = s_movie_on;
+    if (on && (!s_movie_rt.tex || s_movie_rt.w != s_movie_w || s_movie_rt.h != s_movie_h)) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_movie_rt.srv) ID3D11ShaderResourceView_Release(s_movie_rt.srv);
+        if (s_movie_rt.tex) ID3D11Texture2D_Release(s_movie_rt.tex);
+        memset(&s_movie_rt, 0, sizeof s_movie_rt);
+        memset(&td, 0, sizeof td);
+        td.Width = s_movie_w;
+        td.Height = s_movie_h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_movie_rt.tex))) {
+            s_movie_rt.w = s_movie_rt.hw = s_movie_w;
+            s_movie_rt.h = s_movie_rt.hh = s_movie_h;
+            s_movie_new = 1;
+        }
+    }
+    if (on && s_movie_rt.tex && s_movie_new) {
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_movie_rt.tex, 0, NULL,
+                                              s_movie_px, s_movie_w * 4, 0);
+        s_movie_new = 0;
+    }
+    ReleaseSRWLockExclusive(&s_movie_lock);
+    if (!on || !s_movie_rt.tex || !s_back)
+        return 0;
+    present_blit(&s_movie_rt, NV2A_PRESENT_LINEAR);
+    return 1;
+}
+
 static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 /* nv2a_pb_d3d11_back_pixel: a back-buffer pixel read at each flip before
  * Present, since FLIP_DISCARD leaves nothing to read after it. */
@@ -3755,7 +3842,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_occ.ops)
         nv2a_occ_poll(&s_occ, 0);
     present_resize();
-    s_drawn = present_target(surface_offset);
+    s_drawn = movie_present() ? NULL : present_target(surface_offset);
     s_dump_rt = 0;
     if (s_drawn) {
         static int said;
