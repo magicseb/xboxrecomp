@@ -2559,9 +2559,10 @@ void xbox_OverlayShutdown(void)
 /* Every colour the overlay draws comes from one of these tables; nothing
  * below names a number. "game" is the main menu's own scheme (sampled from
  * its front end: ink-navy panels, steel-blue rules and accent, pale blue
- * text, the title red); "classic" is the earlier neutral grey and orange.
- * RECOMP_OVERLAY_THEME=classic picks the second; there is no setting for it
- * (a compile-time table plus that variable). Colours only. */
+ * text, the title red); "classic" is the earlier neutral grey and orange;
+ * "xbox" the original console's dashboard green. RECOMP_OVERLAY_THEME=classic
+ * or =xbox picks one; there is no setting for it (a compile-time table plus
+ * that variable). Colours only. */
 struct Rgb { uint8_t r, g, b; };
 
 struct Theme {
@@ -2656,12 +2657,50 @@ static const Theme k_theme_classic = {
     {12, 12, 14}, {70, 70, 76},
 };
 
+/* "xbox": the original console's dashboard -- near-black green panels, the
+ * lime green of its glow for the accent and the rules, pale green text --
+ * for a port whose own front end is not Burnout 3's (Blinx). */
+static const Theme k_theme_xbox = {
+    "xbox",
+    {0x00, 0x00, 0x00},             /* scrim: black */
+    {0x08, 0x16, 0x0a},             /* panel: the dashboard's dark green */
+    {0x6c, 0xc2, 0x1e}, 1.0f,       /* edge: the lime glow */
+    {0x1c, 0x36, 0x1e},             /* rule */
+    {0x6c, 0xc2, 0x1e}, 0.18f,      /* selected wash: lime */
+    {0x9b, 0xe0, 0x3c},             /* selected bar: the bright lime */
+    {0x6c, 0xc2, 0x1e}, {0x06, 0x12, 0x06}, {0x7c, 0xc0, 0x50}, {0x5a, 0x88, 0x4a},
+    {0xc0, 0xf0, 0xa8},             /* text */
+    {0xec, 0xff, 0xe0},             /* hi */
+    {0x3c, 0x5a, 0x3c},             /* dim */
+    {0x7c, 0xc0, 0x50},             /* info */
+    {0xc0, 0xf0, 0xa8},             /* action */
+    {0x1c, 0x34, 0x1c}, {0x2c, 0x44, 0x2c}, {0x6c, 0xc2, 0x1e}, {0x3a, 0x5a, 0x34},
+    {0xe0, 0xff, 0xd0}, {0x06, 0x12, 0x06},
+    {0xf8, 0xc0, 0x20},             /* warn: attention yellow */
+    {0x94, 0x0c, 0x14}, {0xff, 0xff, 0xff},     /* notice: a red band */
+    {0x08, 0x14, 0x0a}, {0xd8, 0xf8, 0xc8},     /* toast */
+    {0x06, 0x10, 0x08}, {0xe6, 0xff, 0xe0}, {0xb0, 0xe8, 0x90},
+    {0x6c, 0xc2, 0x1e}, {0xe8, 0xc8, 0x46}, {0xe8, 0x48, 0x40}, {0xd8, 0xf8, 0xc8},
+    {0x9b, 0xe0, 0x3c},             /* title: the bright lime */
+    {0x7c, 0xc0, 0x50},             /* hint */
+    {0xa8, 0xe8, 0x70},             /* arrow */
+    {0x06, 0x10, 0x08},             /* bar */
+    {0xf8, 0xc0, 0x20},             /* attn */
+    {0x2e, 0x6a, 0x26},             /* rule_hi */
+    {0x24, 0x5c, 0x1c},             /* arc */
+    {0x04, 0x0c, 0x05},             /* head_band */
+    {0x00, 0x00, 0x00}, {0xf0, 0xff, 0xe8},
+    {0x0a, 0x1c, 0x0c}, {0x2e, 0x6a, 0x26},
+};
+
 static const Theme *T = &k_theme_game;
 
 static void theme_pick()
 {
     const char *e = getenv("RECOMP_OVERLAY_THEME");
-    T = e && !strcmp(e, "classic") ? &k_theme_classic : &k_theme_game;
+    T = e && !strcmp(e, "classic") ? &k_theme_classic
+      : e && !strcmp(e, "xbox")    ? &k_theme_xbox
+      :                              &k_theme_game;
 }
 
 /* ── drawing ───────────────────────────────────────────────────────── */

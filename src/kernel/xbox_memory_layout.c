@@ -2100,8 +2100,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     break;
                 }
                 /* hr_spin (default on, the host grid only): poll without
-                 * sleeping (nv2a_pb_exec.c, hr_spin_asked). */
-                if (nv2a_pb_idle_spin())
+                 * sleeping (nv2a_pb_exec.c, hr_spin_asked). Also within 2 ms
+                 * of the last kick or PUT: a title that kicks hundreds of
+                 * times a frame (Blinx in game) waited out a 50 us nap at
+                 * each, 10-30 ms a frame -- 66% of its main thread's time in
+                 * the KickOff spin, ~24 fps. A pause-only poll answers in
+                 * well under a microsecond, for one core while it kicks. */
+                if (nv2a_pb_idle_spin() || now - last_active < 2000000ull)
                     xbox_CpuRelax();
                 else
                     kick_nap_us(50);

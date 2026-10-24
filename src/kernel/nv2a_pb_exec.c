@@ -2634,11 +2634,19 @@ static int wrap_signed(int c, uint32_t size, uint32_t mode)
  * loop. Read and reset by the RECOMP_FLIP_LOG line. Timestamps are taken per
  * batch and per cache tile, never per pixel. */
 #if defined(_WIN32)
+/* QPC, not timespec_get: that is GetSystemTimePreciseAsFileTime, several
+ * times dearer, and it is read per batch and at every turn of the ack
+ * loop's kick poll -- 8% of the executor's thread in Blinx, at 6,000
+ * batches a frame. Only differences of it are used. */
 static uint64_t rt_now(void)
 {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart / f.QuadPart) * 1000000000ull
+         + (uint64_t)(t.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
 }
 #else
 static uint64_t rt_now(void)

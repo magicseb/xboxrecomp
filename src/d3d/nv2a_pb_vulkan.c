@@ -861,6 +861,10 @@ struct DepthTarget {
     uint64_t         last_use;
     int              fresh;      /* contents undefined: the next pass clears */
     uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
+    /* zeta_texture: the depth read as the guest's Z24S8 bytes, and the
+     * depth-only view the conversion samples. Made at the first read. */
+    struct nvk_image zim;
+    VkImageView      dview;
 };
 
 /* As Metal: 32 slots hold any frame Burnout 3 draws (14 surfaces in Crash
@@ -979,12 +983,16 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         for (i = 0; i < RT_MAX; i++)
             if (s_rt[i].dt == e)
                 s_rt[i].dt = NULL;
-        garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+        garbage_push(&e->im, e->dview, NULL);
+        if (e->zim.img)
+            garbage_push(&e->zim, VK_NULL_HANDLE, NULL);
         memset(e, 0, sizeof *e);
     }
     nv2a_host_size_x2(w, h, nv2a_host_render_scale_x2(), s_max_dim, &e->hw, &e->hh);
+    /* SAMPLED as well: zeta_texture reads it when a title samples its zeta
+     * surface as a texture. */
     if (!nvk_image_new(&e->im, C->depth_format, e->hw, e->hh, 1,
-                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
         return NULL;
     e->zeta = zeta;
@@ -4748,6 +4756,222 @@ static void rt_to_sampled(struct nvk_image *im)
     nvk_image_to(s_cmd, im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
+/* ---- a zeta surface read as a texture ---------------------------------------
+ *
+ * As the D3D11 backend's zeta_texture: a stage whose texture lies on a zeta
+ * surface reads the depth as colour. On the console the bytes are the Z24S8
+ * words, so an A8R8G8B8 read sees A = depth bits 23..16, R = 15..8, G = 7..0,
+ * B = stencil. Here the depth lives only in the depth image and the guest
+ * memory under the zeta offset is empty: Blinx's depth-of-field pass weighted
+ * its blur by it and blurred the whole picture. A compute pass writes the
+ * console's bytes into an RGBA8 image of the depth's size (stencil left 0),
+ * bound in place of the memory decode. */
+static VkDescriptorSetLayout s_zt_dsl;
+static VkPipelineLayout      s_zt_pl;
+static VkPipeline            s_zt_pipe;
+static VkSampler             s_zt_smp;
+static VkDescriptorPool      s_zt_pool[FRAMES_MAX];
+static int                   s_zt_state;   /* 0 untried, 1 ready, -1 failed */
+static RenderTarget          s_zt_rt;      /* rt_texture's non-NULL answer */
+
+static const char s_zt_glsl[] =
+    "#version 450\n"
+    "layout(local_size_x = 8, local_size_y = 8) in;\n"
+    "layout(binding = 0) uniform sampler2D dep;\n"
+    "layout(binding = 1, rgba8) uniform writeonly image2D outp;\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    ivec2 s = imageSize(outp);\n"
+    "    if (p.x >= s.x || p.y >= s.y) return;\n"
+    "    uint z = uint(round(clamp(texelFetch(dep, p, 0).r, 0.0, 1.0) * 16777215.0));\n"
+    "    imageStore(outp, p, vec4(float((z >> 8) & 255u) / 255.0, float(z & 255u) / 255.0,\n"
+    "                             0.0, float((z >> 16) & 255u) / 255.0));\n"
+    "}\n";
+
+static int zt_init(void)
+{
+    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutCreateInfo li;
+    VkPipelineLayoutCreateInfo pi;
+    VkSamplerCreateInfo sc;
+    VkShaderModuleCreateInfo mi;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci;
+    const uint32_t *w;
+    size_t n;
+    int compiled, k;
+    char err[1024];
+
+    if (s_zt_state)
+        return s_zt_state > 0;
+    s_zt_state = -1;
+    memset(b, 0, sizeof b);
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1] = b[0];
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    memset(&li, 0, sizeof li);
+    li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    li.bindingCount = 2;
+    li.pBindings = b;
+    memset(&pi, 0, sizeof pi);
+    pi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pi.setLayoutCount = 1;
+    pi.pSetLayouts = &s_zt_dsl;
+    memset(&sc, 0, sizeof sc);
+    sc.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sc.magFilter = sc.minFilter = VK_FILTER_NEAREST;
+    sc.addressModeU = sc.addressModeV = sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateDescriptorSetLayout(s_dev, &li, NULL, &s_zt_dsl) != VK_SUCCESS
+            || vkCreatePipelineLayout(s_dev, &pi, NULL, &s_zt_pl) != VK_SUCCESS
+            || vkCreateSampler(s_dev, &sc, NULL, &s_zt_smp) != VK_SUCCESS)
+        goto fail;
+    for (k = 0; k < FRAMES_MAX; k++) {
+        VkDescriptorPoolSize ps[2] = {
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 },
+        };
+        VkDescriptorPoolCreateInfo dp;
+        memset(&dp, 0, sizeof dp);
+        dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dp.maxSets = 32;
+        dp.poolSizeCount = 2;
+        dp.pPoolSizes = ps;
+        if (vkCreateDescriptorPool(s_dev, &dp, NULL, &s_zt_pool[k]) != VK_SUCCESS)
+            goto fail;
+    }
+    if (!nvk_glsl_spirv(NVK_STAGE_COMPUTE, s_zt_glsl, &w, &n, &compiled, err, sizeof err)) {
+        fprintf(stderr, LOGP "zeta-as-texture shader: %s\n", err);
+        goto fail;
+    }
+    memset(&mi, 0, sizeof mi);
+    mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    mi.codeSize = n * 4;
+    mi.pCode = w;
+    if (vkCreateShaderModule(s_dev, &mi, NULL, &mod) != VK_SUCCESS)
+        goto fail;
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = mod;
+    ci.stage.pName = "main";
+    ci.layout = s_zt_pl;
+    if (vkCreateComputePipelines(s_dev, VK_NULL_HANDLE, 1, &ci, NULL, &s_zt_pipe) != VK_SUCCESS)
+        s_zt_pipe = VK_NULL_HANDLE;
+    vkDestroyShaderModule(s_dev, mod, NULL);
+    if (!s_zt_pipe)
+        goto fail;
+    s_zt_state = 1;
+    fprintf(stderr, LOGP "zeta-as-texture compute shader ready\n");
+    return 1;
+fail:
+    fprintf(stderr, LOGP "zeta-as-texture compute shader FAILED: a zeta read as a"
+            " texture decodes guest memory\n");
+    return 0;
+}
+
+static int zeta_texture(const Stage *t, VkImageView *view, uint32_t *sw, uint32_t *sh)
+{
+    DepthTarget *dt = NULL;
+    VkDescriptorSetAllocateInfo ai;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorImageInfo ii[2];
+    VkWriteDescriptorSet wr[2];
+    int i;
+
+    if (!t->offset || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
+        return 0;
+    /* One zeta offset can have several depth targets (one per colour target
+     * size it was drawn with). The one the title means is the one of the
+     * texture's size, and of those the one used last (as on D3D11). */
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *c = &s_dt[i];
+        if (!c->im.img || ((c->zeta ^ t->offset) & 0x07FFFFFFu))
+            continue;
+        if (!dt) {
+            dt = c;
+            continue;
+        }
+        {
+            int fit = c->w == t->width && c->h == t->height;
+            int dfit = dt->w == t->width && dt->h == t->height;
+            if ((fit && !dfit) || (fit == dfit && c->last_use > dt->last_use))
+                dt = c;
+        }
+    }
+    if (!dt || dt->fresh || !zt_init())
+        return 0;
+    if (!dt->dview) {
+        VkImageViewCreateInfo vi;
+        memset(&vi, 0, sizeof vi);
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = dt->im.img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = dt->im.format;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(s_dev, &vi, NULL, &dt->dview) != VK_SUCCESS) {
+            dt->dview = VK_NULL_HANDLE;
+            return 0;
+        }
+    }
+    if (!dt->zim.img) {
+        if (!nvk_image_new(&dt->zim, VK_FORMAT_R8G8B8A8_UNORM, dt->hw, dt->hh, 1,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT)) {
+            memset(&dt->zim, 0, sizeof dt->zim);
+            return 0;
+        }
+        fprintf(stderr, LOGP "zeta 0x%08X read as a texture: converted to the guest's"
+                " Z24S8 bytes\n", dt->zeta);
+    }
+    memset(&ai, 0, sizeof ai);
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = s_zt_pool[s_fi];
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &s_zt_dsl;
+    if (vkAllocateDescriptorSets(s_dev, &ai, &set) != VK_SUCCESS)
+        return 0;
+    memset(ii, 0, sizeof ii);
+    ii[0].sampler = s_zt_smp;
+    ii[0].imageView = dt->dview;
+    ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[1].imageView = dt->zim.view;
+    ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    memset(wr, 0, sizeof wr);
+    for (i = 0; i < 2; i++) {
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = set;
+        wr[i].dstBinding = (uint32_t)i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                 : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &ii[i];
+    }
+    vkUpdateDescriptorSets(s_dev, 2, wr, 0, NULL);
+    /* Outside any pass. GENERAL around the dispatch, since the
+     * SHADER_READ_ONLY scope is the fragment stage's only; the next pass on
+     * the depth puts it back to an attachment, and the result goes to the
+     * fragment stage's read layout. */
+    end_encoder();
+    ensure_cmd();
+    nvk_image_to(s_cmd, &dt->im, VK_IMAGE_LAYOUT_GENERAL);
+    nvk_image_to(s_cmd, &dt->zim, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_zt_pipe);
+    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_zt_pl, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(s_cmd, (dt->hw + 7) / 8, (dt->hh + 7) / 8, 1);
+    nvk_image_to(s_cmd, &dt->zim, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    *view = dt->zim.view;
+    *sw = dt->w;
+    *sh = dt->h;
+    return 1;
+}
+
 static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *view,
                                 uint32_t *sw, uint32_t *sh)
 {
@@ -4790,7 +5014,7 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *
         return rt;
     }
     if (!self)
-        return NULL;
+        return zeta_texture(t, view, sw, sh) ? &s_zt_rt : NULL;
     if (!s_self.img || s_self_w != self->w || s_self_h != self->h
             || s_self.w != self->hw || s_self.h != self->hh || s_self.format != self->im.format) {
         if (s_self.img)
@@ -6782,6 +7006,8 @@ static void frame_advance(void)
         vkResetDescriptorPool(s_dev, f->dps[k], 0);
     if (s_hf_pool[s_fi])
         vkResetDescriptorPool(s_dev, s_hf_pool[s_fi], 0);
+    if (s_zt_pool[s_fi])
+        vkResetDescriptorPool(s_dev, s_zt_pool[s_fi], 0);
     f->dp_cur = 0;
     s_tset_last = VK_NULL_HANDLE;
     rings_reset();
