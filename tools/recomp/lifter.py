@@ -118,6 +118,10 @@ def _func_ident(addr, name):
 
 # ── Operand formatting ──────────────────────────────────────
 
+_CTRL_DEBUG_REGS = frozenset(
+    [f"cr{i}" for i in range(9)] + [f"dr{i}" for i in range(8)])
+
+
 def _fmt_reg(name, size=4):
     """Format a register name as a C expression."""
     if not name:
@@ -126,6 +130,13 @@ def _fmt_reg(name, size=4):
     # Segment registers → constants
     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
         return f"0 /* seg:{name} */"
+
+    # Control and debug registers → 0. Titles run in ring 0 and some touch
+    # them: Fable reads cr2 in its own page-fault handler and flushes the TLB
+    # with mov eax,cr3 / mov cr3,eax. The lifted code has no guest paging and
+    # no fault ever reaches that handler, so there is no value to give.
+    if name in _CTRL_DEBUG_REGS:
+        return f"0 /* {name}: privileged */"
 
     # Map sub-registers to expressions on 32-bit locals
     SUB_REGS = {
@@ -146,6 +157,9 @@ def _fmt_set_reg(name, value_expr):
     # Segment registers → no-op
     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
         return f"/* mov {name}, {value_expr} - segment register */;"
+    # Control/debug registers → no-op (see _fmt_reg).
+    if name in _CTRL_DEBUG_REGS:
+        return f"/* mov {name}, {value_expr} - privileged register */;"
 
     SET_MAP = {
         "al": f"SET_LO8(eax, {value_expr})",
