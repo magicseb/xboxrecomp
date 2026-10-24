@@ -119,6 +119,8 @@ extern "C" {
     X(AUDIO_MUTE,        CONFIG, "RECOMP_AUDIO_MUTE",        NULL, "1: no sound") \
     X(AUDIO_MUTE_BG,     CONFIG, "RECOMP_AUDIO_MUTE_BG",     NULL, "1: no sound while the window is in the background") \
     X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default: 5.1 when the default output has 6+ channels), stereo, 5.1") \
+    X(APC_DEFER,         CONFIG, "RECOMP_APC_DEFER",         NULL, "1: a file I/O completion APC waits in a per-thread queue for the issuing thread's next alertable wait, which runs it and returns STATUS_USER_APC, as NT does; unset (default), it runs inside NtReadFile") \
+    X(LANGUAGE,          CONFIG, "RECOMP_LANGUAGE",          NULL, "the dashboard language the title reads (EEPROM XC_LANGUAGE): english (default), japanese, german, french, spanish, italian, korean, chinese, portuguese, or its number 1..9") \
     X(ANDROID_VIBRATION, CONFIG, "RECOMP_ANDROID_VIBRATION", NULL, "Android: where the first pad's rumble goes: auto (the pad when SDL can rumble it, else the device's vibrator when the pad is the device's built-in one; default), controller, device (the vibrator whatever the pad), off. SDL2 cannot rumble a pad on Android: an external pad does not rumble") \
     X(TOUCH_CONTROLS,    CONFIG, "RECOMP_TOUCH_CONTROLS",    NULL, "Android: the on-screen controls (src/input/touch_pad.h): auto (default: hidden while a controller is used, shown again at a touch), always, off") \
     X(TOUCH_OPACITY,     CONFIG, "RECOMP_TOUCH_OPACITY",     NULL, "Android: the on-screen controls' opacity, 0.1..1 (default 0.5)") \

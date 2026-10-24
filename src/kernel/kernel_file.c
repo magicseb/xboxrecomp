@@ -389,6 +389,17 @@ static NTSTATUS __stdcall xbox_NtCreateFile(
          * data on any volume. */
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+        /* An existing directory opened without FILE_DIRECTORY_FILE. NT opens
+         * it unless FILE_NON_DIRECTORY_FILE forbids it; CreateFileW refuses a
+         * directory without FILE_FLAG_BACKUP_SEMANTICS (ERROR_ACCESS_DENIED).
+         * Fable opens D:\data\LightingTable\ this way, read the failure as
+         * a bad disc and stopped on its "dirty or damaged" screen. */
+        {
+            DWORD fa = GetFileAttributesW(win_path);
+            if (fa != INVALID_FILE_ATTRIBUTES && (fa & FILE_ATTRIBUTE_DIRECTORY)
+                && !(CreateOptions & XBOX_FILE_NON_DIRECTORY_FILE))
+                flags_and_attrs |= FILE_FLAG_BACKUP_SEMANTICS;
+        }
         DWORD access = xbox_access_to_win32(DesiredAccess);
         WIN32_FILE_ATTRIBUTE_DATA fad;
         /* An overwrite of an existing non-empty file is deferred (see

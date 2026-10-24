@@ -58,13 +58,19 @@ _COD_ENDP = re.compile(r"^(\S+)\s+ENDP\b")
 
 
 def _find_vcvars():
+    # VCVARS32 names one directly. Visual Studio 2026 installs under "18",
+    # not under its year as 2022 did.
+    env = os.environ.get("VCVARS32")
+    if env and os.path.exists(env):
+        return env
     for root in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                  os.environ.get("ProgramFiles", r"C:\Program Files")):
-        for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
-            p = os.path.join(root, "Microsoft Visual Studio", "2022", ed,
-                             "VC", "Auxiliary", "Build", "vcvars32.bat")
-            if os.path.exists(p):
-                return p
+        for ver in ("2022", "18"):
+            for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
+                p = os.path.join(root, "Microsoft Visual Studio", ver, ed,
+                                 "VC", "Auxiliary", "Build", "vcvars32.bat")
+                if os.path.exists(p):
+                    return p
     return None
 
 
@@ -595,8 +601,13 @@ def _run_xbe(vcvars, workdir, runtime_inc, args):
         r = _msvc(_MSVC_AMD64, "linux/amd64", workdir,
                   "cl /nologo /W3 /EHa /I. xbe_harness.c /Fexbe_harness.exe")
     else:
+        # The harness maps the title's sections at their own addresses, so its
+        # own image must be out of the way: the default 32-bit base,
+        # 0x00400000, sits inside a large title (Fable's runs to 0x009DAA00)
+        # and every section came back "unavailable".
         r = _cl(vcvars, workdir,
-                f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe')
+                f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe'
+                ' /link /BASE:0x50000000 /DYNAMICBASE:NO')
     if r.returncode != 0:
         print("xbe harness build failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)

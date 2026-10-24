@@ -3034,9 +3034,11 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 #undef WD_NV2A
     }
 
+    /* Any mapped guest stack, not only the main one: a worker thread's
+     * slice or a title's own coroutine stack (Fable) lives on the heap. */
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
-        if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
+        if (a < XBOX_STACK_BASE || a >= g_memory_size) break;
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
@@ -4394,7 +4396,12 @@ static int g_heap_block_count = 0;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
+/* Fable: The Lost Chapters runs twelve and more guest threads by the time its
+ * front end loads (a pool of 0x005817BE workers among them). At 8 the next
+ * one ran inline on its creator, blocked on its request event, and the title
+ * deadlocked there. Slices come from the heap only when a thread starts, so
+ * the limit costs nothing for titles that start fewer. */
+#define XBOX_MAX_THREAD_STACKS  32
 
 static int g_thread_stacks_used = 0;
 

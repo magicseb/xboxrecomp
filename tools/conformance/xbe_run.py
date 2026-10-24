@@ -293,6 +293,10 @@ typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_kernel(uint32_t va) { (void)va; return 0; }
+/* rdtsc and privileged instructions (cli/sti, invlpg, wbinvd) lift to calls
+   into the runtime; a title that has them (Fable) left these unresolved. */
+uint64_t xbox_ReadTimeStampCounter(void) { return 0; }
+void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
 
 static unsigned char g_stack[256 * 1024];
 

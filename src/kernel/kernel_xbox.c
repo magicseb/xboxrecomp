@@ -11,7 +11,10 @@
 
 #include "kernel.h"
 #include "apu.h"                /* mcpx_apu_xc_audio: XC_AUDIO */
+#include "recomp_env.h"         /* RECOMP_LANGUAGE: XC_LANGUAGE */
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -122,10 +125,36 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - Region: North America
  *   - Video: none of widescreen/480p/720p/1080i unless set (kernel.h,
  *     xbox_SetVideoSettings)
- *   - Language: English
+ *   - Language: English unless RECOMP_LANGUAGE says otherwise
  *   - Audio: the APU's speaker layout, stereo or 5.1 (Dolby Digital)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
+
+/* XC_LANGUAGE as the dashboard stores it (XDK XC_LANGUAGE_*): 1 English,
+ * 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean,
+ * 8 Chinese, 9 Portuguese. RECOMP_LANGUAGE takes the name or the number;
+ * anything else is English. A title shows a language only if its disc has
+ * it (Fable's PAL disc: Data\lang\English and French). */
+static ULONG xbox_language_setting(void)
+{
+    static const char *const names[] = {
+        "english", "japanese", "german", "french", "spanish",
+        "italian", "korean", "chinese", "portuguese",
+    };
+    const char *v = recomp_env(RENV_LANGUAGE);
+    int i, k;
+
+    if (!v || !*v)
+        return 1;
+    for (i = 0; i < 9; i++) {
+        for (k = 0; v[k] && tolower((unsigned char)v[k]) == names[i][k]; k++)
+            ;
+        if (!v[k] && !names[i][k])
+            return (ULONG)(i + 1);
+    }
+    i = atoi(v);
+    return (i >= 1 && i <= 9) ? (ULONG)i : 1;
+}
 
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
@@ -138,9 +167,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_language_setting();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
