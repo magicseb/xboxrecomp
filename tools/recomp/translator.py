@@ -1249,7 +1249,7 @@ class FunctionTranslator:
         """True when something in the function reads CF."""
         from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
                              _EFLAGS_SETTERS, _FLAGS_UNDEFINED,
-                             _is_rep_compare)
+                             _is_rep_compare, _BARE_STRING_COMPARES)
 
         last_setter = None
         for insn in instructions:
@@ -1275,10 +1275,12 @@ class FunctionTranslator:
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
-            elif _is_rep_compare(insn):
+            elif _is_rep_compare(insn) or m in _BARE_STRING_COMPARES:
                 # A REPE/REPNE CMPS/SCAS produces CF into _cf, so a jb/ja
                 # after one needs it declared. Anything else starting "rep"
-                # (movs/stos) leaves the flags and the setter alone.
+                # (movs/stos) leaves the flags and the setter alone. A bare
+                # scasd/cmpsd is lifted as a one-pass repe loop and writes
+                # the same _cf (Blinx: `scasd; lahf` at 0x01AB92FD).
                 last_setter = "rep-compare"
             elif m in _FLAGS_UNDEFINED or m == "popfd":
                 # A carry test after popfd reads g_eflags, not _cf.

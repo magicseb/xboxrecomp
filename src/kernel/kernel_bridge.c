@@ -1933,6 +1933,11 @@ static void bridge_KeSetEvent(void)
     (void)wait;
 
     h = ke_event_shadow(guest_va);
+    /* Keep the guest's SignalState in step with the shadow: titles read it,
+     * and D3D8 (XDK 4831) clears it by hand before waiting -- see
+     * bridge_KeWaitForSingleObject. */
+    if (h)
+        BRIDGE_MEM32(guest_va + 4) = 1;
     if (!h)
         h = bridge_resolve_handle(guest_va);
     if (!h)
@@ -1953,9 +1958,27 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
-    HANDLE h;
+    HANDLE h, ev;
 
-    h = ke_event_shadow(object);
+    h = ev = ke_event_shadow(object);
+    /* The guest may have cleared the event by writing SignalState itself.
+     * XDK 4831's D3D8 does exactly that for its vblank KEVENT: the frame wait
+     * (0x001325D0 in Blinx) stores 0 to SignalState and then waits, counting
+     * on the next vblank DPC's KeSetEvent. The shadow never saw the store, so
+     * a notification event stayed signalled and every wait returned at once:
+     * the title's frame-tick thread spun, resuming its loader thread 55,000
+     * times a second, and nothing else got the CPU. Honour the store here:
+     * SignalState 0 on a shadow that is signalled means "cleared by hand". */
+    if (ev && BRIDGE_MEM32(object + 4) == 0 &&
+        WaitForSingleObject(ev, 0) == WAIT_OBJECT_0) {
+        static int said;
+        ResetEvent(ev);     /* the probe already consumed a synchronization one */
+        if (said < 4) {
+            said++;
+            fprintf(stderr, "  [KERNEL] KEVENT 0x%08X: SignalState cleared by the"
+                            " guest, shadow reset before the wait\n", object);
+        }
+    }
     if (!h)
         h = bridge_resolve_handle(object);
     if (!h)
@@ -1966,6 +1989,9 @@ static void bridge_KeWaitForSingleObject(void)
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
     xbox_WakeWaitEnd();
+    /* A satisfied wait on a synchronization (auto-reset) event consumed it. */
+    if (ev && g_eax == 0 && BRIDGE_MEM8(object) == 1)
+        BRIDGE_MEM32(object + 4) = 0;
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -7818,8 +7844,12 @@ static void bridge_DbgPrint(void)
 {
     /* First vararg is a guest format string. Log it verbatim (never treat it
      * as a format, it is guest-owned); caller cleans the stack (__cdecl). */
+    /* Not under the kernel log budget: a title prints rarely and only when
+     * something went wrong (Blinx's CRI Sofdec player reports its errors this
+     * way), and those lines are worth more than any of the per-call ones. */
+    static unsigned printed;
     const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(0));
-    if (fmt && KERNEL_LOG_ON()) {
+    if (fmt && printed++ < 2000) {
         size_t i, n = 0;
         for (i = 0; i < 512 && fmt[i]; i++)
             n++;
@@ -8524,6 +8554,8 @@ static void bridge_KeResetEvent(void)
     HANDLE h;
 
     h = ke_event_shadow(guest_va);
+    if (h)
+        BRIDGE_MEM32(guest_va + 4) = 0;     /* mirror, as KeSetEvent does */
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -10887,6 +10919,9 @@ static void kernel_thunk_dispatch(void)
      * arguments or takes any lock (xbox_IrqPost). After the slot is read,
      * since a kernel call in the routine sets it again. */
     xbox_IrqSafePoint();
+    /* And where a thread another one suspended actually stops: no host lock
+     * is held here (kernel_thread.c, NtSuspendThread). */
+    xbox_SuspendSafePoint();
     /* RECOMP_DEBUG=crash_test, once armed: fault or hang here. */
     if (g_xbox_crash_test)
         xbox_crash_test_fire();

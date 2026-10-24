@@ -1738,6 +1738,26 @@ static void kick_nap_us(unsigned us)
     typedef LONG (WINAPI *delay_fn)(BOOLEAN, PLARGE_INTEGER);
     static delay_fn delay;
     static int looked;
+    /* A short nap (the title is kicking) is a spin on native Windows: the
+     * rounding above makes a 50 us delay a whole millisecond at best (15.6
+     * without timeBeginPeriod), and every KickOff waits out one nap of this
+     * thread. Blinx in-game kicks hundreds of times a frame and ran at about
+     * one frame a second. Spinning with SwitchToThread costs this thread's
+     * core only while the title is kicking; the idle nap still sleeps. */
+    if (us <= 200) {
+        static LARGE_INTEGER freq;
+        LARGE_INTEGER t0, t;
+        if (!freq.QuadPart)
+            QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        do {
+            YieldProcessor();
+            SwitchToThread();
+            QueryPerformanceCounter(&t);
+        } while ((uint64_t)(t.QuadPart - t0.QuadPart) * 1000000ull
+                     < (uint64_t)us * (uint64_t)freq.QuadPart);
+        return;
+    }
     if (!looked) {
         HMODULE nt = GetModuleHandleA("ntdll.dll");
         looked = 1;
@@ -4624,8 +4644,38 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
 
     contig_lock();
     if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
+    /* A small block -- a driver's HCCA, endpoint and transfer descriptors,
+     * an APU scratch page -- goes above the loaded image when it can. On
+     * the console contiguous memory never overlaps the image (those pages
+     * are taken), so every device model resolves a physical address that
+     * falls inside the image's range as the image. Blinx's image is 49.7 MB
+     * of the 64 MB: first-fit from the bottom put XPP's HCCA at physical
+     * 0x00E97000, the OHCI model read it out of the MDLB10 section, and the
+     * pad never enumerated. Large blocks (surfaces, textures, the push
+     * buffer) keep the bottom: the image holds no physical pointers to them
+     * that a model has to tell apart, and the room above a big image would
+     * not hold them anyway. A caller that named a physical range is left
+     * alone. The normal search follows if the space above is full. */
+    {
+        uint32_t above = (uint32_t)(((uint64_t)g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
+        if (n <= 16 && phys_lo == 0 && phys_hi == 0xFFFFFFFFu
+                && above > lo_page && (uint64_t)above + n <= limit) {
+            p = (above + align_pages - 1) & ~(align_pages - 1);
+            while ((uint64_t)p + n <= limit) {
+                for (q = p; q < p + n && !g_contig_used[q]; q++)
+                    ;
+                if (q == p + n) {
+                    contig_take(p, n);
+                    result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                    break;
+                }
+                while (q < limit && g_contig_used[q]) q++;
+                p = (q + align_pages - 1) & ~(align_pages - 1);
+            }
+        }
+    }
     p = (lo_page + align_pages - 1) & ~(align_pages - 1);
-    while ((uint64_t)p + n <= limit) {
+    while (!result && (uint64_t)p + n <= limit) {
         /* A request free to go above 16 MB steps over the low reserve. */
         if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
                 && p + n > CONTIG_LOW_RESERVE_START) {

@@ -369,30 +369,137 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
     return STATUS_SUCCESS;
 }
 
+/* ============================================================================
+ * NtSuspendThread / NtResumeThread -- cooperative
+ *
+ * Win32 SuspendThread stops a thread wherever it is, including inside the
+ * host heap or the CRT's stream lock. A guest thread spends much of its time
+ * in host code (every kernel call, every fprintf in the runtime), so a title
+ * that suspends another thread routinely freezes it holding one of those
+ * locks, and the next thread to allocate or log waits for ever. Blinx does
+ * exactly this on its loading screen: the main thread suspends and resumes
+ * the loader thread in a loop to share the CPU, and within seconds the main
+ * thread is stuck in fprintf while two others wait in HeapAlloc/HeapFree.
+ *
+ * On the console the kernel only lets the suspension take effect at a safe
+ * point. This does the same: NtSuspendThread raises a per-thread count, and
+ * the target parks itself at its next kernel call (xbox_SuspendSafePoint,
+ * called from the thunk dispatcher before any lock is taken) until the
+ * count is back to zero. A thread suspending itself parks at once.
+ *
+ * A thread created with CreateSuspended is held by Win32 instead (CREATE_
+ * SUSPENDED in PsCreateSystemThreadEx), so a resume that finds no
+ * cooperative count falls back to ResumeThread.
+ * ============================================================================ */
+
+#define XBOX_SUSPEND_SLOTS 64
+
+typedef struct {
+    DWORD tid;
+    LONG count;
+    HANDLE wake;        /* auto-reset: set when count drops to zero */
+} XboxSuspendSlot;
+
+static XboxSuspendSlot s_suspend[XBOX_SUSPEND_SLOTS];
+static SRWLOCK s_suspend_lock = SRWLOCK_INIT;
+/* Nonzero while any thread has a pending or active suspension: the safe
+ * point's fast path is one read of this. */
+static volatile LONG s_suspend_any;
+
+/* The slot for tid, created when create is set. Caller holds the lock. */
+static XboxSuspendSlot *suspend_slot(DWORD tid, int create)
+{
+    int i, free_i = -1;
+
+    for (i = 0; i < XBOX_SUSPEND_SLOTS; i++) {
+        if (s_suspend[i].tid == tid)
+            return &s_suspend[i];
+        if (free_i < 0 && s_suspend[i].tid == 0)
+            free_i = i;
+    }
+    if (!create || free_i < 0)
+        return NULL;
+    s_suspend[free_i].tid = tid;
+    s_suspend[free_i].count = 0;
+    if (!s_suspend[free_i].wake)
+        s_suspend[free_i].wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    return &s_suspend[free_i];
+}
+
+/* Park the calling thread while its suspend count is nonzero. */
+static void suspend_park_self(DWORD tid)
+{
+    for (;;) {
+        XboxSuspendSlot *sl;
+        HANDLE wake = NULL;
+        LONG count;
+
+        AcquireSRWLockExclusive(&s_suspend_lock);
+        sl = suspend_slot(tid, 0);
+        count = sl ? sl->count : 0;
+        if (sl)
+            wake = sl->wake;
+        ReleaseSRWLockExclusive(&s_suspend_lock);
+        if (count <= 0 || !wake)
+            return;
+        WaitForSingleObject(wake, INFINITE);
+    }
+}
+
+void xbox_SuspendSafePoint(void)
+{
+    if (!s_suspend_any)
+        return;
+    /* Not while this thread is at DISPATCH_LEVEL or holds the one-CPU gate:
+     * the console delivers a suspension as an APC, which waits until IRQL
+     * drops to PASSIVE. Parked here with the gate, no DPC could run -- the
+     * D3D vblank DPC among them, so the title's frame event was never set
+     * and PMC_INTR_EN_0 never restored (Blinx ran at two frames a second
+     * on its loading screen). The count stays; the next kernel call made
+     * at PASSIVE parks it. */
+    if (xbox_IrqlThisThreadBlocksDpcs())
+        return;
+    suspend_park_self(GetCurrentThreadId());
+}
+
 NTSTATUS __stdcall xbox_NtSuspendThread(
     HANDLE ThreadHandle,
     PULONG PreviousSuspendCount)
 {
-    DWORD prev;
+    DWORD tid = GetThreadId(ThreadHandle);
+    XboxSuspendSlot *sl;
+    LONG prev;
 
-    /*
-     * SuspendThread returns the previous suspend count, or (DWORD)-1 on
-     * failure. The Xbox call reports that count through an out-parameter, so
-     * the two are not interchangeable: -1 must become an error status rather
-     * than a suspend count of 0xFFFFFFFF.
-     */
-    prev = SuspendThread(ThreadHandle);
-    if (prev == (DWORD)-1) {
+    if (!tid) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
-            "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
+            "NtSuspendThread: bad handle %p (error %u)", ThreadHandle,
+            GetLastError());
+        return STATUS_INVALID_HANDLE;
+    }
+
+    AcquireSRWLockExclusive(&s_suspend_lock);
+    sl = suspend_slot(tid, 1);
+    if (!sl) {
+        ReleaseSRWLockExclusive(&s_suspend_lock);
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
+            "NtSuspendThread: no free suspend slot for tid %lu",
+            (unsigned long)tid);
         return STATUS_UNSUCCESSFUL;
     }
+    prev = sl->count++;
+    InterlockedIncrement(&s_suspend_any);
+    ReleaseSRWLockExclusive(&s_suspend_lock);
 
     if (PreviousSuspendCount)
         *PreviousSuspendCount = (ULONG)prev;
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,
-        "NtSuspendThread: thread=%p previous_count=%u", ThreadHandle, prev);
+        "NtSuspendThread: tid %lu previous_count=%ld", (unsigned long)tid, prev);
+
+    /* Suspending oneself takes effect now; anyone else stops at their next
+     * kernel call. */
+    if (tid == GetCurrentThreadId())
+        suspend_park_self(tid);
 
     return STATUS_SUCCESS;
 }
@@ -401,21 +508,38 @@ NTSTATUS __stdcall xbox_NtResumeThread(
     HANDLE ThreadHandle,
     PULONG PreviousSuspendCount)
 {
-    DWORD prev;
+    DWORD tid = GetThreadId(ThreadHandle);
+    XboxSuspendSlot *sl;
+    LONG prev = -1;
 
-    /* Mirror of NtSuspendThread: (DWORD)-1 is failure, not a count. */
-    prev = ResumeThread(ThreadHandle);
-    if (prev == (DWORD)-1) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
-            "NtResumeThread: ResumeThread failed (error %u)", GetLastError());
-        return STATUS_UNSUCCESSFUL;
+    AcquireSRWLockExclusive(&s_suspend_lock);
+    sl = tid ? suspend_slot(tid, 0) : NULL;
+    if (sl && sl->count > 0) {
+        prev = sl->count--;
+        InterlockedDecrement(&s_suspend_any);
+        if (sl->count == 0) {
+            SetEvent(sl->wake);
+            sl->tid = 0;    /* slot free again; the event is reused */
+        }
+    }
+    ReleaseSRWLockExclusive(&s_suspend_lock);
+
+    if (prev < 0) {
+        /* No cooperative suspension: a thread created suspended. */
+        DWORD w = ResumeThread(ThreadHandle);
+        if (w == (DWORD)-1) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
+                "NtResumeThread: ResumeThread failed (error %u)", GetLastError());
+            return STATUS_UNSUCCESSFUL;
+        }
+        prev = (LONG)w;
     }
 
     if (PreviousSuspendCount)
         *PreviousSuspendCount = (ULONG)prev;
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,
-        "NtResumeThread: thread=%p previous_count=%u", ThreadHandle, prev);
+        "NtResumeThread: tid %lu previous_count=%ld", (unsigned long)tid, prev);
 
     return STATUS_SUCCESS;
 }

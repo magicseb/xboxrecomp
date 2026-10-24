@@ -2022,6 +2022,11 @@ class Lifter:
             # Segment register pop → discard from stack
             if r in ("fs", "gs", "cs", "ds", "es", "ss"):
                 return [f"{{ uint32_t _tmp; POP32(esp, _tmp); }} /* pop {r} - segment register */"]
+            # 16-bit pop (66 5x): pops two bytes into the low word only. The
+            # register is not a C identifier, so POP32(esp, si) cannot build.
+            if r in ("ax", "cx", "dx", "bx", "sp", "bp", "si", "di"):
+                return [f"{{ uint16_t _tmp = MEM16(esp); esp += 2; "
+                        f"{_fmt_set_reg(r, '_tmp')} }} /* pop {r} (16-bit) */"]
             # Sample esp at each pop in a traced function. An epilogue that ends
             # `mov esp, ebp` restores esp unconditionally, so any drift inside
             # the function is erased before a return-time trace can see it --

@@ -50,6 +50,13 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     # target to actually call into the APU failed at link with an undefined
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
+    # apu_oracle_cap.c takes a pthread mutex. Under MSVC it never links one;
+    # under mingw the SDL2 path pulled winpthread in by accident, and the
+    # D3D11 build failed at link on pthread_mutex_lock without it.
+    if(NOT MSVC)
+        find_package(Threads REQUIRED)
+        target_link_libraries(xbox_apu PRIVATE Threads::Threads)
+    endif()
 else()
     # POSIX (macOS, Linux) and Windows + Vulkan: SDL2 for the audio device
     # (apu_sdl2.c) and libm; on POSIX the platform layer (Win32 primitives)

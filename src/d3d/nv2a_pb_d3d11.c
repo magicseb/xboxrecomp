@@ -898,6 +898,10 @@ typedef struct {
     UINT                    hw, hh;     /* host size (render.scale) */
     ID3D11Texture2D        *tex;
     ID3D11DepthStencilView *dsv;
+    ID3D11ShaderResourceView *srv;      /* the depth half, for zeta-as-texture */
+    ID3D11Texture2D        *ctex;       /* ... converted to the guest's bytes */
+    ID3D11UnorderedAccessView *cuav;
+    ID3D11ShaderResourceView *csrv;
     uint64_t                last_use;
 } DepthTarget;
 
@@ -927,6 +931,10 @@ static DepthTarget *depth_target(UINT w, UINT h)
     }
     if (!e) {
         e = lru;
+        if (e->csrv) ID3D11ShaderResourceView_Release(e->csrv);
+        if (e->cuav) ID3D11UnorderedAccessView_Release(e->cuav);
+        if (e->ctex) ID3D11Texture2D_Release(e->ctex);
+        if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
         ID3D11DepthStencilView_Release(e->dsv);
         ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
@@ -937,17 +945,34 @@ static DepthTarget *depth_target(UINT w, UINT h)
     td.Height = e->hh;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    /* Typeless, so the depth can also be read: a title may sample its zeta
+     * buffer as a colour texture (Blinx's depth of field reads its Z24S8
+     * buffer as A8R8G8B8 to weight the blur), see zeta_texture below. */
+    td.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex)))
         return NULL;
-    if (FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)e->tex,
-                                                   NULL, &e->dsv))) {
-        ID3D11Texture2D_Release(e->tex);
-        e->tex = NULL;
-        return NULL;
+    {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dvd;
+        D3D11_SHADER_RESOURCE_VIEW_DESC svd;
+        memset(&dvd, 0, sizeof dvd);
+        dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        dvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        if (FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)e->tex,
+                                                       &dvd, &e->dsv))) {
+            ID3D11Texture2D_Release(e->tex);
+            e->tex = NULL;
+            return NULL;
+        }
+        memset(&svd, 0, sizeof svd);
+        svd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        svd.Texture2D.MipLevels = 1;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
+                                                         &svd, &e->srv)))
+            e->srv = NULL;          /* no zeta-as-texture for this one */
     }
     /* The CPU path starts its buffer at the far plane, stencil 0. */
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, e->dsv,
@@ -2038,6 +2063,136 @@ static RenderTarget *rt_self_copy(RenderTarget *rt)
     return &s_self;
 }
 
+/* A texture stage that points at a zeta buffer: the title reads its depth as
+ * colour. On the console the bytes are the Z24S8 words, so an A8R8G8B8 read
+ * sees A = depth bits 23..16, R = 15..8, G = 7..0, B = stencil. Here the depth
+ * lives only on the GPU, as z / zmax in a float, and the guest memory under
+ * the zeta offset is empty -- Blinx's depth-of-field pass then weighted its
+ * blur by garbage and blurred the whole picture. A compute pass writes the
+ * same bytes the console would have into an RGBA8 texture of the zeta's size
+ * (stencil is left 0), bound in place of the memory decode. */
+static RenderTarget s_zeta_rt;
+
+static RenderTarget *zeta_texture(const Stage *t)
+{
+    static ID3D11ComputeShader *cs;
+    static int tried;
+    DepthTarget *dt = NULL;
+    ID3D11RenderTargetView *rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11DepthStencilView *odsv = NULL;
+    ID3D11ShaderResourceView *nsrv = NULL;
+    ID3D11UnorderedAccessView *nuav = NULL;
+    int i;
+
+    if (!t->offset || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
+        return NULL;
+    /* One zeta offset can have several depth targets here (one per colour
+     * target size it was drawn with). The one the title means is the one of
+     * the texture's size, and of those the one drawn into last: taking the
+     * first match read a stale buffer from another pass, and Blinx's depth
+     * of field then blurred whole frames whose depth was all far. */
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *c = &s_dt[i];
+        if (!c->tex || !c->srv || ((c->zeta ^ t->offset) & 0x07FFFFFFu))
+            continue;
+        if (!dt) {
+            dt = c;
+            continue;
+        }
+        {
+            int fit = c->w == t->width && c->h == t->height;
+            int dfit = dt->w == t->width && dt->h == t->height;
+            if ((fit && !dfit) || (fit == dfit && c->last_use > dt->last_use))
+                dt = c;
+        }
+    }
+    if (!dt)
+        return NULL;
+    if (!tried) {
+        ID3DBlob *code = NULL;
+        static const char src[] =
+            "Texture2D<float> dep : register(t0);\n"
+            "RWTexture2D<unorm float4> outp : register(u0);\n"
+            "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
+            "    uint w, h; dep.GetDimensions(w, h);\n"
+            "    if (id.x >= w || id.y >= h) return;\n"
+            "    uint z = (uint)round(saturate(dep.Load(int3(id.xy, 0))) * 16777215.0);\n"
+            "    outp[id.xy] = float4(((z >> 8) & 255u) / 255.0, (z & 255u) / 255.0,\n"
+            "                         0.0, ((z >> 16) & 255u) / 255.0);\n"
+            "}\n";
+        tried = 1;
+        if (compile("zeta_as_texture", src, "cs_5_0", &code)) {
+            if (FAILED(ID3D11Device_CreateComputeShader(s_dev,
+                        ID3D10Blob_GetBufferPointer(code),
+                        ID3D10Blob_GetBufferSize(code), NULL, &cs)))
+                cs = NULL;
+            ID3D10Blob_Release(code);
+        }
+        fprintf(stderr, LOGP "zeta-as-texture compute shader %s\n",
+                cs ? "ready" : "FAILED");
+    }
+    if (!cs)
+        return NULL;
+    if (!dt->ctex) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = dt->hw;
+        td.Height = dt->hh;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &dt->ctex)))
+            return NULL;
+        if (FAILED(ID3D11Device_CreateUnorderedAccessView(s_dev,
+                    (ID3D11Resource *)dt->ctex, NULL, &dt->cuav))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)dt->ctex, NULL, &dt->csrv))) {
+            if (dt->cuav) ID3D11UnorderedAccessView_Release(dt->cuav);
+            ID3D11Texture2D_Release(dt->ctex);
+            dt->ctex = NULL;
+            dt->cuav = NULL;
+            return NULL;
+        }
+        fprintf(stderr, LOGP "zeta 0x%08X read as a texture: converted to the"
+                " guest's Z24S8 bytes\n", dt->zeta);
+    }
+    /* The depth cannot be read while it is the bound depth target. */
+    memset(rtvs, 0, sizeof rtvs);
+    ID3D11DeviceContext_OMGetRenderTargets(s_ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                                           rtvs, &odsv);
+    if (odsv == dt->dsv)
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                                               rtvs, NULL);
+    ID3D11DeviceContext_CSSetShader(s_ctx, cs, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 1, &dt->srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &dt->cuav, NULL);
+    ID3D11DeviceContext_Dispatch(s_ctx, (dt->hw + 7) / 8, (dt->hh + 7) / 8, 1);
+    ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 1, &nsrv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &nuav, NULL);
+    ID3D11DeviceContext_CSSetShader(s_ctx, NULL, NULL, 0);
+    if (odsv == dt->dsv)
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                                               rtvs, odsv);
+    for (i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+        if (rtvs[i]) ID3D11RenderTargetView_Release(rtvs[i]);
+    if (odsv) ID3D11DepthStencilView_Release(odsv);
+
+    memset(&s_zeta_rt, 0, sizeof s_zeta_rt);
+    s_zeta_rt.offset = dt->zeta;
+    s_zeta_rt.addr = t->offset;
+    s_zeta_rt.w = dt->w;
+    s_zeta_rt.h = dt->h;
+    s_zeta_rt.hw = dt->hw;
+    s_zeta_rt.hh = dt->hh;
+    s_zeta_rt.tex = dt->ctex;
+    s_zeta_rt.srv = dt->csrv;
+    s_zeta_rt.last_draw = s_seq;
+    return &s_zeta_rt;
+}
+
 static RenderTarget *rt_texture(const Stage *t)
 {
     static int off = -1;
@@ -2067,7 +2222,7 @@ static RenderTarget *rt_texture(const Stage *t)
             return NULL;
         return rt;
     }
-    return self ? rt_self_copy(self) : NULL;
+    return self ? rt_self_copy(self) : zeta_texture(t);
 }
 
 /* The combiner state of the batch being drawn (for the trace), and whether
@@ -2800,6 +2955,75 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
     }
 }
 
+/* BLINX_FRAME_LOG=<present>: one line per batch of that present (target,
+ * depth, blend, the four stages and the render target each one reads), and
+ * at its end every live render target saved as BLINX_FRAME_LOG_DIR/rt_*.bmp.
+ * For finding which pass of a multi-pass frame goes wrong. */
+static long frame_log_at(void)
+{
+    static long at = -2;
+    if (at == -2) {
+        const char *e = getenv("BLINX_FRAME_LOG");
+        at = e ? strtol(e, NULL, 0) : -1;
+    }
+    return at;
+}
+
+/* BLINX_FRAME_LOG_EVERY=n: every nth present from BLINX_FRAME_LOG on. */
+static int frame_log_now(void)
+{
+    static long every = -2;
+    long at = frame_log_at();
+    if (every == -2) {
+        const char *e = getenv("BLINX_FRAME_LOG_EVERY");
+        every = e ? strtol(e, NULL, 0) : 0;
+    }
+    if (at < 0 || (long)s_presents < at)
+        return 0;
+    if (every > 0)
+        return (((long)s_presents - at) % every) == 0;
+    return (long)s_presents == at;
+}
+
+static void frame_log_batch(const struct nv2a_pb_draw *d, RenderTarget *rt)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    int k;
+
+    if (!frame_log_now())
+        return;
+    fprintf(stderr, "[FRAMELOG] draw %llu -> %08X %ux%u n %u prim %u prog %d depth %d/%d"
+            " blend %d s%X d%X eq%X col %08X atest %d ctl0 %08X",
+            (unsigned long long)s_draws, rt->offset, rt->w, rt->h, d->idx_count,
+            d->prim, d->program ? 1 : 0, v->depth_enable, v->depth_mask,
+            g->blend_enable, g->blend_sfactor, g->blend_dfactor, g->blend_equation,
+            g->blend_color, v->atest_enable, v->control0);
+    for (k = 0; k < 4; k++) {
+        const Stage *t = &s_stage[k];
+        if (!t->on)
+            continue;
+        fprintf(stderr, " | t%d %08X f%02X %ux%u flt %08X%s", k, t->offset, t->color,
+                t->width, t->height, t->filter,
+                s_stage_rt[k] ? " RT" : "");
+        if (s_stage_rt[k])
+            fprintf(stderr, "(%08X %ux%u)", s_stage_rt[k]->offset,
+                    s_stage_rt[k]->w, s_stage_rt[k]->h);
+    }
+    fprintf(stderr, "\n");
+    /* A post pass (no depth, a quad or two): its combiner too. */
+    if (d->idx_count <= 8 && !v->depth_enable) {
+        fprintf(stderr, "[FRAMELOG]   rc ctl %08X set %d fcw %08X %08X sf %08X %08X\n",
+                v->rc_ctl, v->rc_set, v->rc_fcw0, v->rc_fcw1, v->rc_sf[0], v->rc_sf[1]);
+        for (k = 0; k < 8 && k < (int)(v->rc_ctl & 0xFu); k++)
+            fprintf(stderr, "[FRAMELOG]   stage %d ci %08X ai %08X co %08X ao %08X"
+                    " c0 %08X c1 %08X\n", k, v->rc_cicw[k], v->rc_aicw[k],
+                    v->rc_cocw[k], v->rc_aocw[k], v->rc_f0[k], v->rc_f1[k]);
+    }
+}
+
+static void dump_texture_bmp(ID3D11Texture2D *src, const char *path);
+
 static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 {
     /* As Metal's: at most three list entries per index, grown to the
@@ -3078,6 +3302,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
         }
     }
+    frame_log_batch(d, rt);
     rt->last_draw = ++s_seq;
     s_cur = NULL;
     s_draws++;
@@ -3148,6 +3373,80 @@ static void dump_back_buffer(const char *path)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
+}
+
+static void dump_texture_bmp(ID3D11Texture2D *src, const char *path)
+{
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *st = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    FILE *f;
+    UINT y;
+
+    if (!src)
+        return;
+    ID3D11Texture2D_GetDesc(src, &td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+        return;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)src);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
+        f = fopen(path, "wb");
+        if (f) {
+            BITMAPFILEHEADER fh;
+            BITMAPINFOHEADER ih;
+            memset(&fh, 0, sizeof fh);
+            memset(&ih, 0, sizeof ih);
+            fh.bfType = 0x4D42;
+            fh.bfOffBits = sizeof fh + sizeof ih;
+            fh.bfSize = fh.bfOffBits + td.Width * td.Height * 4;
+            ih.biSize = sizeof ih;
+            ih.biWidth = (LONG)td.Width;
+            ih.biHeight = -(LONG)td.Height;
+            ih.biPlanes = 1;
+            ih.biBitCount = 32;
+            fwrite(&fh, sizeof fh, 1, f);
+            fwrite(&ih, sizeof ih, 1, f);
+            for (y = 0; y < td.Height; y++)
+                fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, td.Width * 4, 1, f);
+            fclose(f);
+        }
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+}
+
+static void frame_log_dump_rts(void)
+{
+    const char *dir = getenv("BLINX_FRAME_LOG_DIR");
+    char path[MAX_PATH];
+    int i;
+
+    if (!frame_log_now() || !dir)
+        return;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex)
+            continue;
+        snprintf(path, sizeof path, "%s/p%05lu_rt_%08X_%ux%u.bmp", dir, (unsigned long)s_presents, rt->offset, rt->w, rt->h);
+        dump_texture_bmp(rt->tex, path);
+        fprintf(stderr, "[FRAMELOG] dumped %s\n", path);
+    }
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *z = &s_dt[i];
+        if (z->tex)
+            fprintf(stderr, "[FRAMELOG] depth target %d: zeta %08X %ux%u last_use %llu%s\n",
+                    i, z->zeta, z->w, z->h, (unsigned long long)z->last_use,
+                    z->ctex ? " (read as texture)" : "");
+        if (!z->ctex)
+            continue;
+        snprintf(path, sizeof path, "%s/p%05lu_zeta_%08X_%ux%u.bmp", dir,
+                 (unsigned long)s_presents, z->zeta, z->w, z->h);
+        dump_texture_bmp(z->ctex, path);
+    }
 }
 
 static void dump_frame(void)
@@ -3517,6 +3816,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         s_probe_px = (UINT)s_probe_x < s_back_w && (UINT)s_probe_y < s_back_h
                    ? read_tex_pixel(s_back, (UINT)s_probe_x, (UINT)s_probe_y)
                    : 0xDEADBEEFu;
+    frame_log_dump_rts();
     s_presents++;
     dump_frame();
     if (s_latency_wait)   /* a queue slot free: the display's back-pressure */
